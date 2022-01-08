@@ -2,6 +2,8 @@
 
 typedef struct Tree Tree; // Let "Tree" mean the same as "struct Tree".
 
+void tree_print(Tree*);
+
 Tree* tree_new();
 
 void tree_free(Tree*);
