@@ -9,6 +9,7 @@ add_library(err err.c)
 add_library(HashMap HashMap.c)
 add_library(Tree Tree.c)
 add_library(path_utils path_utils.c)
+add_library(safealloc safealloc.c)
 add_executable(main main.c)
 target_link_libraries(main Tree HashMap err pthread)
 
