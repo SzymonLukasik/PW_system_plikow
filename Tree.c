@@ -7,9 +7,9 @@
 #include "path_utils.h"
 #include "HashMap.h"
 #include "safealloc.h"
-#include "pthread.h"
+#include "rwlock.h"
 
-const bool DEBUG = true;
+const bool DEBUG = false;
 void deb(const char* s) {if (DEBUG) fprintf(stderr, "%s\n", s);}
 
 #define pthread_exec(expr) do { \
@@ -26,7 +26,7 @@ struct Tree {
     const char* name;
     HashMap* dirs;
     Tree* parent;
-    pthread_rwlock_t*  rwlock;
+    rwlock*  rwlock;
 };
 
 void tree_print_helper(Tree* tree, char* path, size_t path_len) {
@@ -68,8 +68,8 @@ Tree* tree_new_unnamed() {
     tree->dirs = hmap_new();
     tree->parent = NULL;
 
-    tree->rwlock = safe_malloc(sizeof(pthread_rwlock_t));
-    pthread_exec(pthread_rwlock_init(tree->rwlock, NULL));
+    tree->rwlock = safe_malloc(sizeof(rwlock));
+    rwlock_init(tree->rwlock);
     return tree;
 }
 
@@ -95,6 +95,7 @@ void tree_free(Tree* tree) {
         tree_free(kid);
     }
     free((char*) tree->name);
+    rwlock_destroy(tree->rwlock);
     free(tree->rwlock);
     hmap_free(tree->dirs);
     free(tree);
@@ -104,23 +105,27 @@ bool is_root_path(const char* path) {
     return (path[0] == '/' && path[1] == '\0');
 }
 
-void tree_unlock_to_root(Tree* tree) {
+void tree_rdunlock_to_root(Tree* tree) {
     while (tree) {
-        pthread_exec(pthread_rwlock_unlock(tree->rwlock));
+        rwlock_rdunlock(tree->rwlock);
         tree = tree->parent;
     }
 }
 
 void tree_rdlock(Tree* tree) {
-    pthread_exec(pthread_rwlock_rdlock(tree->rwlock));
+    rwlock_rdlock(tree->rwlock);
 }
 
-void tree_rwlock(Tree* tree) {
-    pthread_exec(pthread_rwlock_wrlock(tree->rwlock));
+void tree_wrlock(Tree* tree) {
+    rwlock_wrlock(tree->rwlock);
+}
+
+void tree_wrunlock(Tree* tree) {
+    rwlock_wrunlock(tree->rwlock);
 }
 
 enum path_rdlock_scope {
-    NONE = 0, INCLUDING = 1, EXCLUDING = 2
+    NO_LOCK = 0, INCLUDING = 1, EXCLUDING = 2
 };
 
 typedef enum path_rdlock_scope path_rdlock_scope;
@@ -132,7 +137,7 @@ Tree* tree_get_subdir(Tree* tree, const char* subpath,
     while ((subpath = split_path(subpath, component))) {
         if (rdlock) tree_rdlock(tree);
         if (!(kid = hmap_get(tree->dirs, component))) {
-            if (rdlock) tree_unlock_to_root(tree);
+            if (rdlock) tree_rdunlock_to_root(tree);
             return NULL;
         }
         tree = kid;
@@ -146,7 +151,7 @@ char* tree_list(Tree* tree, const char* path) {
     Tree* subdir = tree_get_subdir(tree, path, INCLUDING);
     if (subdir == NULL) return NULL;
     char* s = make_map_contents_string(subdir->dirs);
-    tree_unlock_to_root(subdir);
+    tree_rdunlock_to_root(subdir);
     return s;
 }
 
@@ -170,20 +175,21 @@ int get_parent(Tree* tree, const char* path, Tree** parent, char** name,
 }
 
 int tree_create(Tree* tree, const char* path) {
-    deb("CREATE");
     Tree* parent;
     char* name;
     if (is_root_path(path)) return EEXIST; // get_parent would return EBUSY.
     tree_exec(get_parent(tree, path, &parent, &name, EXCLUDING));
-    tree_rwlock(parent);
+    tree_wrlock(parent);
     if (hmap_get(parent->dirs, name) != NULL) {
         free(name);
-        tree_unlock_to_root(parent);
+        tree_wrunlock(parent);
+        tree_rdunlock_to_root(parent->parent);
         return EEXIST;
     }
     Tree* new_dir = tree_new_dir(name, parent);
     hmap_insert(parent->dirs, name, new_dir);
-    tree_unlock_to_root(parent);
+    tree_wrunlock(parent);
+    tree_rdunlock_to_root(parent->parent);
     return 0;
 }
 
@@ -191,10 +197,11 @@ int split(Tree* tree, const char* path, Tree** splitted, Tree** _parent, bool rd
     Tree* parent;
     char* name;
     tree_exec(get_parent(tree, path, &parent, &name, rdlock ? EXCLUDING : NONE));
-    if (rdlock) tree_rwlock(parent);
+    if (rdlock) tree_wrlock(parent);
     if (!(*splitted = hmap_get(parent->dirs, name))) {
         free(name);
-        if (rdlock) tree_unlock_to_root(parent);
+        if (rdlock) tree_wrunlock(parent);
+        if (rdlock) tree_rdunlock_to_root(parent->parent);
         return ENOENT;
     }
     hmap_remove(parent->dirs, name);
@@ -204,17 +211,18 @@ int split(Tree* tree, const char* path, Tree** splitted, Tree** _parent, bool rd
 }
 
 int tree_remove(Tree* tree, const char* path) {
-    deb("REMOVE");
     Tree* target;
     Tree* parent;
     tree_exec(split(tree, path, &target, &parent, true));
     if (hmap_size(target->dirs) > 0) {
         hmap_insert(parent->dirs, target->name, target);
-        tree_unlock_to_root(parent);
+        tree_wrunlock(parent);
+        tree_rdunlock_to_root(parent->parent);
         return ENOTEMPTY;
     }
     tree_free(target);
-    tree_unlock_to_root(parent);
+    tree_wrunlock(parent);
+    tree_rdunlock_to_root(parent->parent);
     return 0;
 }
 
@@ -222,12 +230,11 @@ bool split_paths_common(const char** source, const char** target,
                         char* component1, char* component2) {
     bool success = (*source = split_path(*source, component1));
     success = (*target = split_path(*target, component2)) && success;
-    success = (strcmp(component1, component2) != 0) && success;
+    success = (strcmp(component1, component2) == 0) && success;
     return success;
 }
 
 int tree_get_lca(Tree* tree, const char* source, const char* target, Tree** lca) {
-    if (!is_path_valid(source) || !is_path_valid(target)) return EINVAL;
     char component1[MAX_FOLDER_NAME_LENGTH + 1];
     char component2[MAX_FOLDER_NAME_LENGTH + 1];
     Tree* parent = NULL;
@@ -235,44 +242,51 @@ int tree_get_lca(Tree* tree, const char* source, const char* target, Tree** lca)
         tree_rdlock(tree);
         parent = tree;
         if (!(tree = hmap_get(tree->dirs, component1))) {
-            tree_unlock_to_root(parent);
+            tree_rdunlock_to_root(parent);
             return ENOENT;
         }
     }
-    if (source == NULL && target == NULL) {
-        if (parent) tree_unlock_to_root(parent);
-        return 0;
-    }
-    if (source == NULL) {
-        if (parent) tree_unlock_to_root(parent);
-        return -1;
-    }
-    if (target == NULL) {
-        if (parent) tree_unlock_to_root(parent);
-        return EEXIST;
-    }
-
-    deb(tree->name);
-    tree_rwlock(tree);
-    deb(tree->name);
+    tree_wrlock(tree);
     *lca = tree;
     return 0;
 }
 
+enum move_paths_cmp {
+    EQUAL, TARGET_INCLUDES_SOURCE, SOURCE_INCLUDES_TARGET, DISJOINT
+};
+
+typedef enum move_paths_cmp move_paths_cmp;
+
+move_paths_cmp verify_paths(const char* source, const char* target) {
+    char component1[MAX_FOLDER_NAME_LENGTH + 1];
+    char component2[MAX_FOLDER_NAME_LENGTH + 1];
+    while (split_paths_common(&source, &target, component1, component2)) {}
+    if (source != NULL && target != NULL) return DISJOINT;
+    if (source != NULL) return TARGET_INCLUDES_SOURCE;
+    if (target != NULL) return SOURCE_INCLUDES_TARGET;
+    return EQUAL;
+}
+
 int tree_move(Tree* tree, const char* source_path, const char* target_path) {
-    deb("MOVE");
+    if (!is_path_valid(source_path) || !is_path_valid(target_path)) return EINVAL;
     if (is_root_path(source_path)) return EBUSY;
+    move_paths_cmp paths_cmp = verify_paths(source_path, target_path);
+    if (paths_cmp == SOURCE_INCLUDES_TARGET) return -1;
 
     Tree* lca;
-    deb("LOL");
     tree_exec(tree_get_lca(tree, source_path, target_path, &lca));
-    deb(lca->name);
+    if (paths_cmp == EQUAL) {
+        tree_wrunlock(lca);
+        tree_rdunlock_to_root(lca->parent);
+        return 0;
+    }
 
     Tree* target_parent;
     char* target_name;
     int err;
     if ((err = get_parent(tree, target_path, &target_parent, &target_name, false)) != 0) {
-        tree_unlock_to_root(lca);
+        tree_wrunlock(lca);
+        tree_rdunlock_to_root(lca->parent);
         return (err == EBUSY ? EEXIST : err);
     }
 
@@ -280,14 +294,17 @@ int tree_move(Tree* tree, const char* source_path, const char* target_path) {
     Tree* source_parent;
     if ((err = split(tree, source_path, &source, &source_parent, false)) != 0) {
         free(target_name);
-        tree_unlock_to_root(lca);
+        tree_wrunlock(lca);
+        tree_rdunlock_to_root(lca->parent);
         return err;
     }
 
-    if (hmap_get(target_parent->dirs, target_name) != NULL) {
+    if (paths_cmp == TARGET_INCLUDES_SOURCE
+        || hmap_get(target_parent->dirs, target_name) != NULL) {
         hmap_insert(source_parent->dirs, source->name, source);
         free(target_name);
-        tree_unlock_to_root(lca);
+        tree_wrunlock(lca);
+        tree_rdunlock_to_root(lca->parent);
         return EEXIST;
     }
 
@@ -295,6 +312,7 @@ int tree_move(Tree* tree, const char* source_path, const char* target_path) {
     source->name = target_name;
     hmap_insert(target_parent->dirs, target_name, source);
     source->parent = target_parent;
-    tree_unlock_to_root(lca);
+    tree_wrunlock(lca);
+    tree_rdunlock_to_root(lca->parent);
     return 0;
 }
