@@ -132,7 +132,7 @@ typedef enum path_rdlock_scope path_rdlock_scope;
 
 Tree* tree_get_subdir(Tree* tree, const char* subpath,
                       path_rdlock_scope rdlock) {
-    char component[MAX_FOLDER_NAME_LENGTH + 1];
+    char component[MAX_FOLDER_NAME_LENGTH + 1] = "";
     Tree* kid;
     while ((subpath = split_path(subpath, component))) {
         if (rdlock) tree_rdlock(tree);
@@ -235,8 +235,8 @@ bool split_paths_common(const char** source, const char** target,
 }
 
 int tree_get_lca(Tree* tree, const char* source, const char* target, Tree** lca) {
-    char component1[MAX_FOLDER_NAME_LENGTH + 1];
-    char component2[MAX_FOLDER_NAME_LENGTH + 1];
+    char component1[MAX_FOLDER_NAME_LENGTH + 1] = "";
+    char component2[MAX_FOLDER_NAME_LENGTH + 1] = "";
     Tree* parent = NULL;
     while (split_paths_common(&source, &target, component1, component2)) {
         tree_rdlock(tree);
@@ -258,8 +258,8 @@ enum move_paths_cmp {
 typedef enum move_paths_cmp move_paths_cmp;
 
 move_paths_cmp verify_paths(const char* source, const char* target) {
-    char component1[MAX_FOLDER_NAME_LENGTH + 1];
-    char component2[MAX_FOLDER_NAME_LENGTH + 1];
+    char component1[MAX_FOLDER_NAME_LENGTH + 1] = "";
+    char component2[MAX_FOLDER_NAME_LENGTH + 1] = "";
     while (split_paths_common(&source, &target, component1, component2)) {}
     if (source != NULL && target != NULL) return DISJOINT;
     if (source != NULL) return TARGET_INCLUDES_SOURCE;
